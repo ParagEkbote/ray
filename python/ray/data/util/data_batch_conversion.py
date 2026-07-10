@@ -38,6 +38,24 @@ class BatchFormat(str, Enum):
     # TODO: Remove once Arrow is deprecated as user facing batch format
     ARROW = "arrow"
     NUMPY = "numpy"  # Either a single numpy array or a Dict of numpy arrays.
+    CUDF = "cudf"
+
+
+_CUDF_UNSET = object()
+_cudf = _CUDF_UNSET
+
+
+def _lazy_import_cudf():
+    """Lazy import cudf, returning the module or None if not installed."""
+    global _cudf
+    if _cudf is _CUDF_UNSET:
+        try:
+            import cudf
+
+            _cudf = cudf
+        except ImportError:
+            _cudf = None
+    return _cudf
 
 
 def _convert_batch_type_to_pandas(
@@ -71,11 +89,16 @@ def _convert_batch_type_to_pandas(
         data = pd.DataFrame(tensor_dict)
     elif pyarrow is not None and isinstance(data, pyarrow.Table):
         data = data.to_pandas()
-    elif not isinstance(data, pd.DataFrame):
-        raise ValueError(
-            f"Received data of type: {type(data)}, but expected it to be one "
-            f"of {DataBatchType}"
-        )
+    else:
+        # Handle cudf.DataFrame (lazy check to avoid import when not used)
+        cudf = _lazy_import_cudf()
+        if cudf is not None and isinstance(data, cudf.DataFrame):
+            data = data.to_pandas()
+        if not isinstance(data, pd.DataFrame):
+            raise ValueError(
+                f"Received data of type: {type(data)}, but expected it to be one "
+                f"of {DataBatchType}"
+            )
     if cast_tensor_columns:
         data = _cast_tensor_columns_to_ndarrays(data)
     return data
@@ -120,7 +143,15 @@ def _convert_pandas_to_batch_type(
                 "install Pyarrow."
             )
         return pyarrow.Table.from_pandas(data)
-
+    elif type == BatchFormat.CUDF:
+        cudf = _lazy_import_cudf()
+        if cudf is None:
+            raise ValueError(
+                "Attempted to convert data to cuDF DataFrame but cuDF "
+                "is not installed. Please do `pip install cudf-cu12` to "
+                "install cuDF (GPU required)."
+            )
+        return cudf.from_pandas(data)
     else:
         raise ValueError(
             f"Received type {type}, but expected it to be one of {DataBatchType}"
@@ -180,6 +211,10 @@ def _convert_batch_type_to_numpy(
     elif isinstance(data, pd.DataFrame):
         return _convert_pandas_to_batch_type(data, BatchFormat.NUMPY)
     else:
+        # Handle cudf.DataFrame via pandas path
+        cudf = _lazy_import_cudf()
+        if cudf is not None and isinstance(data, cudf.DataFrame):
+            return _convert_pandas_to_batch_type(data.to_pandas(), BatchFormat.NUMPY)
         raise ValueError(
             f"Received data of type: {type(data)}, but expected it to be one "
             f"of {DataBatchType}"
@@ -235,7 +270,21 @@ def _cast_ndarray_columns_to_tensor_extension(df: "pd.DataFrame") -> "pd.DataFra
     # TODO(Clark): Optimize this with propagated DataFrame metadata containing a list of
     # column names containing tensor columns, to make this an O(# of tensor columns)
     # check rather than the current O(# of columns) check.
-    for col_name, col in df.items():
+
+    # Scan dtypes rather than df.items(), which would
+    # materialize a Series for every column just to read its dtype.
+    # The below approach avoids the cost of a Series build for non-tensor columns.
+    #
+    # When column names are unique we select and assign by label.
+    # With duplicate names, ``df[col_name]`` returns a DataFrame
+    # rather than a Series, so we select and assign by position instead.
+    columns_unique = df.columns.is_unique
+    for i, (col_name, dtype) in enumerate(df.dtypes.items()):
+        if (
+            dtype.type is not np.object_
+        ):  # Short circuit if non-object type before materializing the column
+            continue
+        col = df[col_name] if columns_unique else df.iloc[:, i]
         if column_needs_tensor_extension(col):
             try:
                 # Suppress Pandas warnings:
@@ -246,7 +295,10 @@ def _cast_ndarray_columns_to_tensor_extension(df: "pd.DataFrame") -> "pd.DataFra
                     warnings.simplefilter("ignore", category=FutureWarning)
                     if SettingWithCopyWarning is not None:
                         warnings.simplefilter("ignore", category=SettingWithCopyWarning)
-                    df[col_name] = TensorArray(col)
+                    if columns_unique:
+                        df[col_name] = TensorArray(col)
+                    else:
+                        df.isetitem(i, TensorArray(col))
             except Exception as e:
                 raise ValueError(
                     f"Tried to cast column {col_name} to the TensorArray tensor "
@@ -299,8 +351,16 @@ def _cast_tensor_columns_to_ndarrays(
                     for arr in df[field.name]
                 ]
 
-    for col_name, col in df.items():
-        if isinstance(col.dtype, TensorDtype):
+    # Scan dtypes rather than df.items(), which would
+    # materialize a Series for every column just to read its dtype.
+    # The below approach avoids the cost of a Series build for non-tensor columns.
+    #
+    # When column names are unique we select and assign by label (the fast,
+    # cached path). With duplicate names, ``df[col_name]`` returns a DataFrame
+    # rather than a Series, so we select and assign by position instead.
+    columns_unique = df.columns.is_unique
+    for i, (col_name, dtype) in enumerate(df.dtypes.items()):
+        if isinstance(dtype, TensorDtype):
             # Suppress Pandas warnings:
             # https://github.com/ray-project/ray/issues/29270
             # We actually want in-place operations so we surpress this warning.
@@ -309,5 +369,8 @@ def _cast_tensor_columns_to_ndarrays(
                 warnings.simplefilter("ignore", category=FutureWarning)
                 if SettingWithCopyWarning is not None:
                     warnings.simplefilter("ignore", category=SettingWithCopyWarning)
-                df[col_name] = list(col.to_numpy())
+                if columns_unique:
+                    df[col_name] = list(df[col_name].to_numpy())
+                else:
+                    df.isetitem(i, list(df.iloc[:, i].to_numpy()))
     return df
